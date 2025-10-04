@@ -1,10 +1,6 @@
-# dags/green_taxi_pipeline.py
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.operators.bash import BashOperator
-# from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
-# from airflow.providers.apache.hive.operators.hive import HiveOperator
-# from airflow.utils.dates import days_ago
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
@@ -33,7 +29,7 @@ dag = DAG(
     description='Monthly green taxi data ingestion and processing pipeline',
     schedule_interval='0 2 1 * *',  # Run at 2 AM on the 1st of each month
     max_active_runs=1,
-    tags=['taxi', 'monthly', 'ingestion']
+    tags=['taxi', 'monthly', 'ingestion', 'dimensional_model']
 )
 
 def download_taxi_zone_lookup(**context):
@@ -262,7 +258,129 @@ upload_to_hdfs_task = BashOperator(
     dag=dag
 )
 
-# Add cleanup task
+# Hive table creation task
+create_hive_tables_task = BashOperator(
+    task_id='create_hive_tables',
+    bash_command="""
+    cat > /tmp/create_tables.sql << 'EOF'
+    CREATE DATABASE IF NOT EXISTS taxi_warehouse;
+    USE taxi_warehouse;
+    
+    CREATE TABLE IF NOT EXISTS DimTime (
+        time_id STRING,
+        full_date TIMESTAMP,
+        year INT,
+        month INT,
+        day INT,
+        hour INT,
+        minute INT,
+        second INT,
+        weekday INT,
+        quarter INT
+    )
+    STORED AS PARQUET;
+    
+    CREATE TABLE IF NOT EXISTS DimLocation (
+        location_id INT,
+        center_lat DOUBLE,
+        center_lon DOUBLE,
+        geo_hash STRING,
+        borough STRING
+    )
+    STORED AS PARQUET;
+    
+    CREATE TABLE IF NOT EXISTS DimPayment (
+        payment_id INT,
+        payment_type STRING
+    )
+    STORED AS PARQUET;
+    
+    CREATE TABLE IF NOT EXISTS FactTrip (
+        trip_id STRING,
+        start_time_id STRING,  
+        start_location_id INT,       
+        end_location_id INT,         
+        payment_id INT,         
+        trip_duration_sec INT,
+        trip_distance_km DOUBLE,
+        total_amount DOUBLE
+    )
+    PARTITIONED BY (year_month STRING)
+    STORED AS PARQUET;
+    
+    CREATE TABLE IF NOT EXISTS staging_rides_geo (
+        trip_id STRING,
+        start_time TIMESTAMP,
+        pu_location_id INT,
+        do_location_id INT,
+        payment_id INT,
+        start_geo_hash STRING,
+        end_geo_hash STRING,
+        trip_duration_sec INT,
+        trip_distance_km DOUBLE,
+        total_amount DOUBLE
+    )
+    PARTITIONED BY (year_month STRING)
+    STORED AS PARQUET;
+    EOF
+    
+    beeline -u jdbc:hive2://hive-server:10000 -f /tmp/create_tables.sql
+    """,
+    dag=dag
+)
+
+spark_data_quality_task = BashOperator(
+    task_id='spark_data_quality_transform',
+    bash_command="""
+    spark-submit \
+        --master local[*] \
+        --driver-memory 2g \
+        /root/airflow/dags/spark_jobs/data_quality_transform.py \
+        {{ ti.xcom_pull(task_ids='download_and_transform', key='year_month') }}
+    """,
+    dag=dag
+)
+
+spark_dimensional_model_task = BashOperator(
+    task_id='spark_apply_dimensional_model',
+    bash_command="""
+    spark-submit \
+        --master local[*] \
+        --driver-memory 2g \
+        /root/airflow/dags/spark_jobs/apply_dimensional_model.py \
+        {{ ti.xcom_pull(task_ids='download_and_transform', key='year_month') }}
+    """,
+    dag=dag
+)
+
+# Data quality report task
+data_quality_report_task = BashOperator(
+    task_id='generate_quality_report',
+    bash_command="""
+    year_month="{{ ti.xcom_pull(task_ids='download_and_transform', key='year_month') }}"
+    
+    echo "=============================="
+    echo "Data Quality Report"
+    echo "=============================="
+    echo "Year-Month: ${year_month}"
+    echo ""
+    
+    # Check record counts
+    echo "Record Counts:"
+    echo "- Raw data:"
+    hdfs dfs -du -h /data/green_taxi/raw/${year_month}/ | awk '{print "  Size: " $1 " " $2}'
+    echo "- Transformed data:"
+    hdfs dfs -du -h /data/green_taxi/transformed/${year_month}/ | awk '{print "  Size: " $1 " " $2}'
+    echo "- Staging data:"
+    hdfs dfs -du -h /data/green_taxi/staging/${year_month}/ | awk '{print "  Size: " $1 " " $2}'
+    
+    echo ""
+    echo "Pipeline completed at $(date)"
+    """,
+    dag=dag
+)
+
+# cleanup task
 cleanup_task = BashOperator(
     task_id='cleanup_temp_files',
     bash_command="""
@@ -280,6 +398,7 @@ cleanup_task = BashOperator(
     trigger_rule='all_done'  # Run regardless of upstream success/failure
 )
 
-# Set task dependencies
-download_zone_lookup_task >> download_transform_task >> validate_task >> upload_to_hdfs_task >> cleanup_task
-
+# Task dependencies
+download_zone_lookup_task >> download_transform_task >> validate_task >> upload_to_hdfs_task
+upload_to_hdfs_task >> create_hive_tables_task >> spark_data_quality_task
+spark_data_quality_task >> spark_dimensional_model_task >> data_quality_report_task >> cleanup_task

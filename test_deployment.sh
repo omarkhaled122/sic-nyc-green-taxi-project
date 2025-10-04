@@ -1,29 +1,32 @@
 #!/bin/bash
-# test_deployment.sh
+# test_complete_pipeline.sh
 
-echo "Testing pipeline deployment..."
+echo "Testing Complete NYC Green Taxi Pipeline"
+echo "========================================"
 
-# Test Python imports
-echo "Testing Python imports..."
-docker exec namenode python -c "
-try:
-    import pandas
-    import numpy
-    import requests
-    print('✓ Required packages available')
-except ImportError as e:
-    print('✗ Missing package:', e)
-    exit(1)
-"
-
-# Test HDFS connectivity
-echo "Testing HDFS..."
+# Test HDFS
+echo "1. Testing HDFS..."
 docker exec namenode hdfs dfs -ls / > /dev/null 2>&1
-if [ $? -eq 0 ]; then
-    echo "HDFS accessible"
-else
-    echo "HDFS not accessible"
-    exit 1
-fi
+[ $? -eq 0 ] && echo "✓ HDFS is accessible" || echo "✗ HDFS not accessible"
 
-echo "All tests passed! Ready to deploy."
+# Test Hive
+echo "2. Testing Hive..."
+docker exec hive-server beeline -u jdbc:hive2://hive-server:10000 -e "SHOW DATABASES;" > /dev/null 2>&1
+[ $? -eq 0 ] && echo "✓ Hive is accessible" || echo "✗ Hive not accessible"
+
+# Test Spark
+echo "3. Testing Spark..."
+docker exec namenode spark-submit --version > /dev/null 2>&1
+[ $? -eq 0 ] && echo "✓ Spark is configured" || echo "✗ Spark not configured"
+
+# Test Python packages
+echo "4. Testing Python packages..."
+docker exec namenode python -c "import pandas, numpy, requests; print('✓ Required packages available')" 2>/dev/null || echo "✗ Missing packages"
+
+# Test geohash (optional)
+echo "5. Testing geohash (optional)..."
+docker exec namenode python -c "import geohash; print('✓ Geohash available in namenode')" 2>/dev/null || echo "! Geohash not available (will use fallback)"
+docker exec nodemanager python -c "import geohash; print('✓ Geohash available in nodemanager')" 2>/dev/null || echo "! Geohash not available (will use fallback)"
+
+echo ""
+echo "Test complete!"

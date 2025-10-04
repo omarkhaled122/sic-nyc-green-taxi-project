@@ -1,0 +1,143 @@
+# docker-compose-minimal.yml
+version: '3'
+
+services:
+  # HDFS NameNode with Airflow & Spark
+  namenode:
+    image: mrugankray/namenode-spark-airflow-flume-zepplin:1.1
+    container_name: namenode
+    restart: always
+    ports:
+      - "49870:9870"   # NameNode web UI
+      - "49000:9000"   # HDFS
+      - "48080:8080"   # Spark master UI
+      - "44040:4040"   # Spark driver UI
+      - "43000:3000"   # Airflow UI
+    volumes:
+      - hadoop_namenode:/hadoop/dfs/name
+      - hadoop_namenode_conda:/root/anaconda
+      - hadoop_namenode_spark:/opt/spark
+      - ./configs:/root/airflow
+      - ./dags:/root/airflow/dags
+    environment:
+      - CLUSTER_NAME=hadoop-learning
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
+    env_file:
+      - ./hadoop.env
+
+  # HDFS DataNode
+  datanode:
+    image: mrugankray/datanode-python:1.0
+    container_name: datanode
+    restart: always
+    volumes:
+      - hadoop_datanode:/hadoop/dfs/data
+      - hadoop_datanode_conda:/root/anaconda
+    environment:
+      SERVICE_PRECONDITION: "namenode:9870"
+      CORE_CONF_fs_defaultFS: "hdfs://namenode:9000"
+    ports:
+      - "49864:9864"   # Datanode web UI
+    env_file:
+      - ./hadoop.env
+
+  # YARN ResourceManager
+  resourcemanager:
+    image: mrugankray/resourcemanager-python:1.0
+    container_name: resourcemanager
+    restart: always
+    volumes:
+      - hadoop_resourcemanager_conda:/root/anaconda
+    environment:
+      SERVICE_PRECONDITION: "namenode:9000 namenode:9870 datanode:9864"
+    ports:
+      - "48088:8088"   # ResourceManager web UI
+    env_file:
+      - ./hadoop.env
+
+  # YARN NodeManager
+  nodemanager:
+    image: mrugankray/nodemanager-python:1.0
+    container_name: nodemanager
+    restart: always
+    volumes:
+      - hadoop_nodemanager_conda:/root/anaconda
+    environment:
+      SERVICE_PRECONDITION: "namenode:9000 namenode:9870 datanode:9864 resourcemanager:8088"
+    ports:
+      - "48042:8042"   # NodeManager web UI
+    env_file:
+      - ./hadoop.env
+
+  # Hive Metastore PostgreSQL
+  hive-metastore-postgresql:
+    image: bde2020/hive-metastore-postgresql:2.3.0
+    container_name: hive-metastore-postgresql
+    volumes:
+      - hive_metastore_pg_data:/var/lib/postgresql/data
+
+  # Hive Metastore
+  hive-metastore:
+    image: bde2020/hive:2.3.2-postgresql-metastore
+    container_name: hive-metastore
+    env_file:
+      - ./hadoop.env
+    command: /opt/hive/bin/hive --service metastore
+    environment:
+      SERVICE_PRECONDITION: "namenode:9000 namenode:9870 datanode:9864 hive-metastore-postgresql:5432"
+    ports:
+      - "49083:9083"
+    depends_on:
+      - hive-metastore-postgresql
+
+  # Hive Server
+  hive-server:
+    image: bde2020/hive:2.3.2-postgresql-metastore
+    container_name: hive-server
+    depends_on:
+      - namenode
+      - datanode
+      - hive-metastore
+    env_file:
+      - ./hadoop.env
+    environment:
+      HIVE_CORE_CONF_javax_jdo_option_ConnectionURL: "jdbc:postgresql://hive-metastore/metastore"
+      SERVICE_PRECONDITION: "hive-metastore:9083"
+    ports:
+      - "20000:10000"
+
+  # Hue (Optional - for easy Hive querying)
+  huedb:
+    image: postgres:15.1-alpine3.17
+    container_name: huedb
+    volumes:
+      - hue_pg_data:/var/lib/postgresql/data/
+    environment:
+      POSTGRES_USER: hue
+      POSTGRES_PASSWORD: hue
+      POSTGRES_DB: hue
+
+  hue:
+    image: gethue/hue:4.6.0
+    container_name: hue
+    ports:
+      - "48890:8888"
+    env_file:
+      - ./hadoop.env
+    volumes:
+      - ./hue-overrides.ini:/usr/share/hue/desktop/conf/hue-overrides.ini
+    depends_on:
+      - huedb
+      - hive-server
+
+volumes:
+  hadoop_namenode:
+  hadoop_namenode_conda:
+  hadoop_namenode_spark:
+  hadoop_datanode:
+  hadoop_datanode_conda:
+  hadoop_resourcemanager_conda:
+  hadoop_nodemanager_conda:
+  airflow_namenode:
+  hive_metastore_pg_data:
+  hue_pg_data:
